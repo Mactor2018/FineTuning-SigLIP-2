@@ -1,3 +1,5 @@
+import json
+import os
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -14,13 +16,8 @@ from datasets import Dataset, Image, ClassLabel
 from transformers import (
     TrainingArguments,
     Trainer,
-    ViTImageProcessor,
-    ViTForImageClassification,
     DefaultDataCollator
 )
-from transformers import AutoModel, AutoProcessor
-from transformers.image_utils import load_image
-
 import torch
 from torch.utils.data import DataLoader
 from torchvision.transforms import (
@@ -35,236 +32,342 @@ from torchvision.transforms import (
     ToTensor
 )
 
-from PIL import Image, ExifTags
 from PIL import Image as PILImage
 from PIL import ImageFile
-# Enable loading truncated images
+# 启用加载截断图片
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-from datasets import load_dataset
-dataset = load_dataset("--your--dataset--goes--here--", split="train")
+# 添加logging和tqdm
+import logging
+from tqdm.auto import tqdm
+import argparse
+from transformers import AutoImageProcessor, SiglipForImageClassification
 
-from pathlib import Path
-
-file_names = []
-labels = []
-
-for example in dataset:
-    file_path = str(example['image'])
-    label = example['label']
-
-    file_names.append(file_path)
-    labels.append(label)
-
-print(len(file_names), len(labels))
-
-df = pd.DataFrame.from_dict({"image": file_names, "label": labels})
-print(df.shape)
-
-df.head()
-df['label'].unique()
-
-y = df[['label']]
-df = df.drop(['label'], axis=1)
-ros = RandomOverSampler(random_state=83)
-df, y_resampled = ros.fit_resample(df, y)
-del y
-df['label'] = y_resampled
-del y_resampled
-gc.collect()
-
-dataset[0]["image"]
-dataset[9999]["image"]
-
-labels_subset = labels[:5]
-print(labels_subset)
-
-labels_list = ['example_label_1', 'example_label_2']
-
-label2id, id2label = {}, {}
-for i, label in enumerate(labels_list):
-    label2id[label] = i
-    id2label[i] = label
-
-ClassLabels = ClassLabel(num_classes=len(labels_list), names=labels_list)
-
-print("Mapping of IDs to Labels:", id2label, '\n')
-print("Mapping of Labels to IDs:", label2id)
-
-def map_label2id(example):
-    example['label'] = ClassLabels.str2int(example['label'])
-    return example
-
-dataset = dataset.map(map_label2id, batched=True)
-dataset = dataset.cast_column('label', ClassLabels)
-dataset = dataset.train_test_split(test_size=0.4, shuffle=True, stratify_by_column="label")
-
-train_data = dataset['train']
-test_data = dataset['test']
-
-from transformers import AutoImageProcessor
-from transformers import SiglipForImageClassification
-
-# Use AutoImageProcessor instead of AutoProcessor
-model_str = "google/siglip2-base-patch16-224"
-processor = AutoImageProcessor.from_pretrained(model_str)
-
-# Extract preprocessing parameters
-image_mean, image_std = processor.image_mean, processor.image_std
-size = processor.size["height"]
-
-# Define training transformations
-_train_transforms = Compose([
-    Resize((size, size)),
-    RandomRotation(90),
-    RandomAdjustSharpness(2),
-    ToTensor(),
-    Normalize(mean=image_mean, std=image_std)
-])
-
-# Define validation transformations
-_val_transforms = Compose([
-    Resize((size, size)),
-    ToTensor(),
-    Normalize(mean=image_mean, std=image_std)
-])
-
-# Apply transformations to dataset
-def train_transforms(examples):
-    examples['pixel_values'] = [_train_transforms(image.convert("RGB")) for image in examples['image']]
-    return examples
-
-def val_transforms(examples):
-    examples['pixel_values'] = [_val_transforms(image.convert("RGB")) for image in examples['image']]
-    return examples
-
-# Assuming train_data and test_data are loaded datasets
-train_data.set_transform(train_transforms)
-test_data.set_transform(val_transforms)
-
-def collate_fn(examples):
-    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-    labels = torch.tensor([example['label'] for example in examples])
-    return {"pixel_values": pixel_values, "labels": labels}
-
-model = SiglipForImageClassification.from_pretrained(model_str, num_labels=len(labels_list))
-model.config.id2label = id2label
-model.config.label2id = label2id
-
-print(model.num_parameters(only_trainable=True) / 1e6)
-
-accuracy = evaluate.load("accuracy")
-
-def compute_metrics(eval_pred):
-    predictions = eval_pred.predictions
-    label_ids = eval_pred.label_ids
-
-    predicted_labels = predictions.argmax(axis=1)
-    acc_score = accuracy.compute(predictions=predicted_labels, references=label_ids)['accuracy']
-
-    return {
-        "accuracy": acc_score
-    }
-
-args = TrainingArguments(
-    output_dir="siglip2-finetune",
-    logging_dir='./logs',
-    evaluation_strategy="epoch",
-    learning_rate=2e-6,
-    per_device_train_batch_size=32,
-    per_device_eval_batch_size=8,
-    num_train_epochs=6,
-    weight_decay=0.02,
-    warmup_steps=50,
-    remove_unused_columns=False,
-    save_strategy='epoch',
-    load_best_model_at_end=True,
-    save_total_limit=1,
-    report_to="none"
+# 设置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("training.log"),
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger(__name__)
 
-trainer = Trainer(
-    model,
-    args,
-    train_dataset=train_data,
-    eval_dataset=test_data,
-    data_collator=collate_fn,
-    compute_metrics=compute_metrics,
-    tokenizer=processor,
-)
+# 创建参数解析器
+def parse_args():
+    parser = argparse.ArgumentParser(description="SigLIP模型微调训练脚本")
+    parser.add_argument("--data_path", type=str, required=True, help="JSON数据文件路径")
+    parser.add_argument("--base_dir", type=str, default="/work/home/yinshb/yinshb/zjx/model_and_data/data", help="图像文件的基础目录")
+    parser.add_argument("--output_dir", type=str, default="checkpoints/siglip2-finetune", help="输出目录")
+    parser.add_argument("--model_name", type=str, default="google/siglip2-so400m-patch14-384", help="预训练模型名称")
+    parser.add_argument("--batch_size", type=int, default=16, help="训练批量大小")
+    parser.add_argument("--eval_batch_size", type=int, default=8, help="评估批量大小")
+    parser.add_argument("--learning_rate", type=float, default=2e-6, help="学习率")
+    parser.add_argument("--num_epochs", type=int, default=6, help="训练轮数")
+    parser.add_argument("--weight_decay", type=float, default=0.02, help="权重衰减")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--test_size", type=float, default=0.3, help="测试集比例")
+    return parser.parse_args()
 
-trainer.evaluate()
+def main():
+    # 解析命令行参数
+    args = parse_args()
+    
+    # 设置随机种子
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    
+    logger.info(f"加载数据: {args.data_path}")
+    # 1. 加载JSON数据
+    with open(args.data_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
 
-trainer.train()
+    # 2. 提取图片路径和标签
+    file_names = []
+    labels = []
 
-trainer.evaluate()
+    for item in tqdm(data, desc="处理数据项"):
+        image_path = item["image"]
+        # 获取最后一个对话作为标签
+        label = item["conversations"][-1]["value"]
+        
+        file_names.append(image_path)
+        labels.append(label)
 
-outputs = trainer.predict(test_data)
-print(outputs.metrics)
+    logger.info(f"总样本数: {len(file_names)}")
 
-y_true = outputs.label_ids
-y_pred = outputs.predictions.argmax(1)
+    # 3. 创建数据框
+    df = pd.DataFrame({"image": file_names, "label": labels})
+    logger.info(f"数据框大小: {df.shape}")
 
-def plot_confusion_matrix(cm, classes, title='Confusion Matrix', cmap=plt.cm.Blues, figsize=(10, 8)):
+    # 查看前几条记录和标签分布
+    logger.info("数据样例:")
+    logger.info(df.head())
+    logger.info("\n标签分布:")
+    label_counts = df['label'].value_counts().head(10).to_dict()
+    for label, count in label_counts.items():
+        logger.info(f"{label}: {count}")
 
-    plt.figure(figsize=figsize)
+    # 4. 处理标签
+    # 获取唯一标签列表
+    unique_labels = df['label'].unique().tolist()
+    logger.info(f"共有 {len(unique_labels)} 个不同类别")
 
-    plt.imshow(cm, interpolation='nearest', cmap=cmap)
-    plt.title(title)
-    plt.colorbar()
+    # 创建标签映射
+    label2id = {label: idx for idx, label in enumerate(unique_labels)}
+    id2label = {idx: label for idx, label in enumerate(unique_labels)}
 
-    tick_marks = np.arange(len(classes))
-    plt.xticks(tick_marks, classes, rotation=90)
-    plt.yticks(tick_marks, classes)
+    # 5. 将标签转换为ID
+    df['label_id'] = df['label'].map(label2id)
 
-    fmt = '.0f'
-    thresh = cm.max() / 2.0
-    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
-        plt.text(j, i, format(cm[i, j], fmt), horizontalalignment="center", color="white" if cm[i, j] > thresh else "black")
+    # 6. 创建数据集对象
+    # 假设图片路径是相对于某个基础目录的
+    base_dir = args.base_dir  # 从参数获取
 
-    plt.ylabel('True label')
-    plt.xlabel('Predicted label')
-    plt.tight_layout()
-    plt.show()
+    def get_image_path(relative_path):
+        return os.path.join(base_dir, relative_path)
 
-accuracy = accuracy_score(y_true, y_pred)
-f1 = f1_score(y_true, y_pred, average='macro')
+    # 构建数据集
+    def create_dataset(dataframe):
+        return Dataset.from_dict({
+            "image": [get_image_path(path) for path in dataframe["image"]],
+            "label": dataframe["label_id"].tolist()
+        })
 
-print(f"Accuracy: {accuracy:.4f}")
-print(f"F1 Score: {f1:.4f}")
+    # 7. 按照指定比例拆分数据集
+    from sklearn.model_selection import train_test_split
 
-if len(labels_list) <= 150:
-    cm = confusion_matrix(y_true, y_pred)
-    plot_confusion_matrix(cm, labels_list, figsize=(8, 6))
+    # 确保分层抽样
+    logger.info(f"按照 {1-args.test_size}:{args.test_size} 比例拆分数据集...")
+    train_df, test_df = train_test_split(
+        df, 
+        test_size=args.test_size,
+        random_state=args.seed,
+        stratify=df['label']  # 确保标签分布一致
+    )
 
-print()
-print("Classification report:")
-print()
-print(classification_report(y_true, y_pred, target_names=labels_list, digits=4))
+    logger.info(f"训练集大小: {train_df.shape}")
+    logger.info(f"测试集大小: {test_df.shape}")
 
-trainer.save_model()
+    # 8. 创建数据集对象
+    logger.info("创建数据集对象...")
+    train_dataset = create_dataset(train_df)
+    test_dataset = create_dataset(test_df)
 
-#upload to hub
-from huggingface_hub import notebook_login
-notebook_login()
+    # 9. 添加图像加载功能
+    def load_and_transform_images(examples, split="train"):
+        images = []
+        error_count = 0
+        for image_path in examples["image"]:
+            try:
+                # 加载图像
+                img = PILImage.open(image_path).convert("RGB")
+                images.append(img)
+            except Exception as e:
+                error_count += 1
+                logger.warning(f"无法加载图像 {image_path}: {e}")
+                # 添加一个黑色图像作为替代
+                img = PILImage.new("RGB", (224, 224), color=0)
+                images.append(img)
+        
+        if error_count > 0:
+            logger.warning(f"{split}集中有 {error_count} 个图像无法加载")
+        
+        examples["image"] = images
+        return examples
 
-from huggingface_hub import HfApi
+    # 应用图像加载
+    logger.info("加载训练集图像...")
+    train_dataset = train_dataset.map(
+        lambda examples: load_and_transform_images(examples, "train"),
+        batched=True,
+        batch_size=16,
+        desc="加载训练集图像"
+    )
 
-api = HfApi()
-repo_id = f"prithivMLmods/siglip2-finetune"
+    logger.info("加载测试集图像...")
+    test_dataset = test_dataset.map(
+        lambda examples: load_and_transform_images(examples, "test"),
+        batched=True,
+        batch_size=16,
+        desc="加载测试集图像"
+    )
 
-try:
-    api.create_repo(repo_id)
-    print(f"Repo {repo_id} created")
+    # 10. 设置特征信息
+    train_dataset = train_dataset.cast_column("image", Image())
+    test_dataset = test_dataset.cast_column("image", Image())
 
-except:
+    # 创建ClassLabel对象
+    class_labels = ClassLabel(num_classes=len(unique_labels), names=unique_labels)
+    train_dataset = train_dataset.cast_column("label", class_labels)
+    test_dataset = test_dataset.cast_column("label", class_labels)
 
-    print(f"Repo {repo_id} already exists")
+    logger.info("数据集准备完成!")
 
-api.upload_folder(
-    folder_path="siglip2-finetune/",
-    path_in_repo=".",
-    repo_id=repo_id,
-    repo_type="model",
-    revision="main"
-)
+    # 加载模型和处理器
+    logger.info(f"加载模型: {args.model_name}")
+    processor = AutoImageProcessor.from_pretrained(args.model_name)
+
+    # 提取预处理参数
+    image_mean, image_std = processor.image_mean, processor.image_std
+    size = processor.size["height"]
+
+    # 定义训练转换
+    _train_transforms = Compose([
+        Resize((size, size)),
+        RandomRotation(90),
+        RandomAdjustSharpness(2),
+        ToTensor(),
+        Normalize(mean=image_mean, std=image_std)
+    ])
+
+    # 定义验证转换
+    _val_transforms = Compose([
+        Resize((size, size)),
+        ToTensor(),
+        Normalize(mean=image_mean, std=image_std)
+    ])
+
+    # 应用转换到数据集
+    def train_transforms(examples):
+        examples['pixel_values'] = [_train_transforms(image) for image in examples['image']]
+        return examples
+
+    def val_transforms(examples):
+        examples['pixel_values'] = [_val_transforms(image) for image in examples['image']]
+        return examples
+
+    # 应用转换
+    logger.info("应用数据转换...")
+    train_dataset.set_transform(train_transforms)
+    test_dataset.set_transform(val_transforms)
+
+    def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        labels = torch.tensor([example['label'] for example in examples])
+        return {"pixel_values": pixel_values, "labels": labels}
+
+    # 加载SigLIP模型用于分类
+    model = SiglipForImageClassification.from_pretrained(args.model_name, num_labels=len(unique_labels))
+    model.config.id2label = id2label
+    model.config.label2id = label2id
+
+    logger.info(f"可训练参数数量：{model.num_parameters(only_trainable=True) / 1e6:.2f}M")
+
+    # 定义评估指标
+    metric = evaluate.combine(["accuracy", "f1"])
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        predictions = np.argmax(logits, axis=1)
+        
+        return metric.compute(predictions=predictions, references=labels, average="weighted")
+
+    # 训练参数设置
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        logging_dir=os.path.join(args.output_dir, 'logs'),
+        evaluation_strategy="epoch",
+        learning_rate=args.learning_rate,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.eval_batch_size,
+        num_train_epochs=args.num_epochs,
+        weight_decay=args.weight_decay,
+        warmup_steps=50,
+        remove_unused_columns=False,
+        save_strategy='epoch',
+        load_best_model_at_end=True,
+        save_total_limit=1,
+        report_to="none",
+        logging_strategy="steps",
+        logging_steps=10,
+        seed=args.seed
+    )
+
+    # 初始化训练器
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        data_collator=collate_fn,
+        compute_metrics=compute_metrics,
+        tokenizer=processor,
+    )
+
+    # 在训练前评估
+    logger.info("训练前评估...")
+    initial_results = trainer.evaluate()
+    logger.info(f"训练前评估结果: {initial_results}")
+
+    # 开始训练
+    logger.info("开始训练...")
+    trainer.train()
+
+    # 训练后评估
+    logger.info("训练后评估...")
+    final_results = trainer.evaluate()
+    logger.info(f"训练后评估结果: {final_results}")
+
+    # 保存最终模型
+    model_path = os.path.join(args.output_dir, "final")
+    trainer.save_model(model_path)
+    processor.save_pretrained(model_path)
+    logger.info(f"模型已保存到 {model_path}")
+
+    # 进行模型预测
+    logger.info("生成预测...")
+    predictions = trainer.predict(test_dataset)
+    preds = np.argmax(predictions.predictions, axis=1)
+
+    # 生成分类报告
+    y_true = test_df['label_id'].values
+    y_pred = preds
+    class_names = [id2label[i] for i in range(len(unique_labels))]
+
+    logger.info("分类报告:")
+    report = classification_report(y_true, y_pred, target_names=class_names)
+    logger.info("\n" + report)
+
+    # 绘制混淆矩阵
+    def plot_confusion_matrix(cm, classes, normalize=False, title='混淆矩阵', cmap=plt.cm.Blues):
+        if normalize:
+            cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+            logger.info("归一化混淆矩阵")
+        else:
+            logger.info('未归一化混淆矩阵')
+
+        plt.figure(figsize=(12, 10))
+        plt.imshow(cm, interpolation='nearest', cmap=cmap)
+        plt.title(title)
+        plt.colorbar()
+        tick_marks = np.arange(len(classes))
+        plt.xticks(tick_marks, classes, rotation=45, ha='right')
+        plt.yticks(tick_marks, classes)
+
+        fmt = '.2f' if normalize else 'd'
+        thresh = cm.max() / 2.
+        for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+            plt.text(j, i, format(cm[i, j], fmt),
+                    horizontalalignment="center",
+                    color="white" if cm[i, j] > thresh else "black")
+
+        plt.tight_layout()
+        plt.ylabel('真实标签')
+        plt.xlabel('预测标签')
+        cm_path = os.path.join(args.output_dir, 'confusion_matrix.png')
+        plt.savefig(cm_path, dpi=300, bbox_inches='tight')
+        logger.info(f"混淆矩阵已保存到 {cm_path}")
+
+    # 计算并绘制混淆矩阵
+    logger.info("生成混淆矩阵...")
+    confusion_mtx = confusion_matrix(y_true, y_pred)
+    plot_confusion_matrix(confusion_mtx, classes=class_names, normalize=True, title='归一化混淆矩阵')
+
+    logger.info("训练和评估完成！")
+
+if __name__ == "__main__":
+    main() 
