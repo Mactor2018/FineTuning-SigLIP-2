@@ -43,6 +43,11 @@ from tqdm.auto import tqdm
 import argparse
 from transformers import AutoImageProcessor, SiglipForImageClassification
 
+# 添加分布式训练支持
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
 # 设置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -73,12 +78,32 @@ def parse_args():
     parser.add_argument("--sample_size", type=int, default=None, help="仅使用部分数据进行训练，如果设置则只使用指定数量的样本")
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"], help="混合精度训练类型")
     parser.add_argument("--resize_size", type=int, default=None, help="调整图像大小的目标尺寸，默认使用模型的要求")
+    parser.add_argument("--local_rank", type=int, default=-1, help="用于分布式训练的本地进程排名")
+    parser.add_argument("--use_deepspeed", action="store_true", help="是否使用DeepSpeed进行训练")
     return parser.parse_args()
 
 def main():
     # 解析命令行参数
     args = parse_args()
     
+    # 初始化分布式训练环境
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if local_rank != -1:
+        args.local_rank = local_rank
+    
+    # 是否启用分布式训练
+    is_distributed = args.local_rank != -1
+    
+    if is_distributed:
+        torch.cuda.set_device(args.local_rank)
+        dist.init_process_group(backend="nccl")
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        logger.info(f"启动分布式训练: rank {rank} / {world_size}")
+        # 只在主进程上打印信息
+        if rank != 0:
+            logger.setLevel(logging.WARNING)
+
     # 设置随机种子
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -101,7 +126,7 @@ def main():
     file_names = []
     labels = []
 
-    for item in tqdm(data, desc="处理数据项"):
+    for item in tqdm(data, desc="处理数据项", disable=not (not is_distributed or args.local_rank==0)):
         image_path = item["image"]
         # 获取最后一个对话作为标签
         label = item["conversations"][-1]["value"]
@@ -256,20 +281,27 @@ def main():
     logger.info(f"训练集大小: {len(train_img_dataset)}")
     logger.info(f"测试集大小: {len(test_img_dataset)}")
     
+    # 为分布式训练创建采样器
+    train_sampler = DistributedSampler(train_img_dataset) if is_distributed else None
+    test_sampler = DistributedSampler(test_img_dataset, shuffle=False) if is_distributed else None
+    
     # 创建数据加载器，降低worker数量
     train_dataloader = DataLoader(
         train_img_dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),  # 如果使用分布式采样器，则不需要在DataLoader中进行shuffle
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=False,  # 禁用pin_memory以减少内存使用
-        persistent_workers=True if args.num_workers > 0 else False  # 保持worker进程存活以加速迭代
+        persistent_workers=True if args.num_workers > 0 else False,  # 保持worker进程存活以加速迭代
+        drop_last=True if is_distributed else False  # 在分布式训练中，确保每个批次具有相同的大小
     )
     
     test_dataloader = DataLoader(
         test_img_dataset,
         batch_size=args.eval_batch_size,
         shuffle=False,
+        sampler=test_sampler,
         num_workers=args.num_workers,
         pin_memory=False,
         persistent_workers=True if args.num_workers > 0 else False
@@ -321,7 +353,12 @@ def main():
         bf16=args.mixed_precision == "bf16",  # 启用BF16训练
         gradient_accumulation_steps=1,  # 可以增加以减少内存使用
         gradient_checkpointing=True,  # 启用梯度检查点以减少内存使用
-        optim="adamw_torch"
+        optim="adamw_torch",
+        # 分布式训练参数
+        local_rank=args.local_rank,
+        ddp_find_unused_parameters=False,
+        ddp_bucket_cap_mb=500,
+        deepspeed=os.path.join("configs", "deepspeed_config.json") if args.use_deepspeed else None
     )
 
     # 创建一个虚拟数据集，以便Trainer能够正确初始化
@@ -345,6 +382,13 @@ def main():
             
         def get_test_dataloader(self, test_dataset=None):
             return test_dataloader
+        
+        def _set_sampler_epoch(self, epoch):
+            # 在每个epoch开始时设置分布式采样器的epoch
+            if is_distributed and hasattr(self.get_train_dataloader(), "sampler"):
+                sampler = self.get_train_dataloader().sampler
+                if isinstance(sampler, DistributedSampler):
+                    sampler.set_epoch(epoch)
 
     # 初始化训练器
     trainer = CustomTrainer(
@@ -365,48 +409,53 @@ def main():
     logger.info("开始训练...")
     trainer.train()
 
-    # 训练后评估
-    logger.info("训练后评估...")
-    final_results = trainer.evaluate()
-    logger.info(f"训练后评估结果: {final_results}")
+    # 训练后评估 - 只在主进程上执行
+    if not is_distributed or args.local_rank == 0:
+        logger.info("训练后评估...")
+        final_results = trainer.evaluate()
+        logger.info(f"训练后评估结果: {final_results}")
 
-    # 保存最终模型
-    model_path = os.path.join(args.output_dir, "final")
-    trainer.save_model(model_path)
-    processor.save_pretrained(model_path)
-    logger.info(f"模型已保存到 {model_path}")
+        # 保存最终模型
+        model_path = os.path.join(args.output_dir, "final")
+        trainer.save_model(model_path)
+        processor.save_pretrained(model_path)
+        logger.info(f"模型已保存到 {model_path}")
 
-    # 保存标签映射
-    with open(os.path.join(model_path, "label_mappings.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "id2label": id2label,
-            "label2id": label2id
-        }, f, ensure_ascii=False, indent=2)
-    
-    # 收集预测结果
-    logger.info("生成预测...")
-    all_preds = []
-    all_labels = []
-    
-    model.eval()
-    with torch.no_grad():
-        for batch in tqdm(test_dataloader, desc="生成预测"):
-            inputs = {k: v.to(model.device) for k, v in batch.items() if k != "labels"}
-            labels = batch["labels"].to(model.device)
-            
-            outputs = model(**inputs)
-            preds = torch.argmax(outputs.logits, dim=1)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-    
-    # 生成分类报告
-    logger.info("分类报告:")
-    class_names = [id2label[i] for i in range(len(unique_labels))]
-    report = classification_report(all_labels, all_preds, target_names=class_names)
-    logger.info("\n" + report)
+        # 保存标签映射
+        with open(os.path.join(model_path, "label_mappings.json"), "w", encoding="utf-8") as f:
+            json.dump({
+                "id2label": id2label,
+                "label2id": label2id
+            }, f, ensure_ascii=False, indent=2)
+        
+        # 收集预测结果
+        logger.info("生成预测...")
+        all_preds = []
+        all_labels = []
+        
+        model.eval()
+        with torch.no_grad():
+            for batch in tqdm(test_dataloader, desc="生成预测"):
+                inputs = {k: v.to(model.device) for k, v in batch.items() if k != "labels"}
+                labels = batch["labels"].to(model.device)
+                
+                outputs = model(**inputs)
+                preds = torch.argmax(outputs.logits, dim=1)
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+        
+        # 生成分类报告
+        logger.info("分类报告:")
+        class_names = [id2label[i] for i in range(len(unique_labels))]
+        report = classification_report(all_labels, all_preds, target_names=class_names)
+        logger.info("\n" + report)
 
-    logger.info("训练和评估完成！")
+        logger.info("训练和评估完成！")
+    
+    # 分布式训练环境清理
+    if is_distributed:
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main() 
